@@ -183,9 +183,9 @@ jobs:
           '@
           $patchPath = Join-Path $env:RUNNER_TEMP 'tomodachi-android-mmap.patch'
           [IO.File]::WriteAllText($patchPath, $patch + "`n")
-          git apply --check -p2 --directory=build/work $patchPath
+          git apply --ignore-space-change --check -p2 --directory=build/work $patchPath
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git apply -p2 --directory=build/work $patchPath
+          git apply --ignore-space-change -p2 --directory=build/work $patchPath
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build and verify the signed ARM64 APK
