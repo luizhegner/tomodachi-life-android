@@ -1,0 +1,277 @@
+name: Tomodachi Life Android (ARM64 rebase test)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tomodachi-android
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event.repository.private
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Check private input configuration
+        shell: pwsh
+        env:
+          DUMP_ZIP_URL: ${{ secrets.DUMP_ZIP_URL }}
+        run: |
+          if ($env:DUMP_ZIP_URL -notmatch '^https://') {
+            throw 'Set the DUMP_ZIP_URL Actions secret to a private, direct HTTPS download URL.'
+          }
+
+      - name: Check out TomodachiLife-recomp v1.0.3
+        uses: actions/checkout@v4
+        with:
+          repository: josiahg2502-glitch/TomodachiLife-recomp
+          ref: b7ba15075e7303f79b2f941f09d30003f49aa80c
+          path: recomp
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Configure Android tools
+        shell: pwsh
+        run: |
+          $sdk = $env:ANDROID_HOME
+          $ndk = Join-Path $sdk 'ndk/27.3.13750724'
+          if (!(Test-Path (Join-Path $ndk 'sources/third_party/shaderc/third_party/glslang/Android.mk'))) {
+            throw 'The Windows runner needs Android NDK r27d with glslang sources.'
+          }
+          if (!(Test-Path (Join-Path $sdk 'platforms/android-35/android.jar'))) {
+            throw 'The Windows runner needs Android SDK Platform 35.'
+          }
+          "ANDROID_NDK_ROOT=$ndk" >> $env:GITHUB_ENV
+          "JAVA_HOME=$env:JAVA_HOME_17_X64" >> $env:GITHUB_ENV
+          "$env:JAVA_HOME_17_X64/bin" >> $env:GITHUB_PATH
+
+      - name: Download and extract the private dump
+        shell: pwsh
+        env:
+          DUMP_ZIP_URL: ${{ secrets.DUMP_ZIP_URL }}
+        run: |
+          $dump = Join-Path $env:GITHUB_WORKSPACE 'dump'
+          $zip = Join-Path $env:RUNNER_TEMP 'tomodachi-dump.zip'
+          New-Item -ItemType Directory -Path $dump | Out-Null
+          try {
+            curl.exe --fail --silent --location --proto '=https' --proto-redir '=https' --retry 2 --output $zip -- $env:DUMP_ZIP_URL
+            if ($LASTEXITCODE -ne 0) { throw 'Could not download the dump. Check the private link and its expiration.' }
+            tar.exe -xf $zip -C $dump
+            if ($LASTEXITCODE -ne 0) { throw 'The download must be a ZIP with exefs and romfs at its root.' }
+          } finally {
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          }
+          foreach ($file in 'exefs/main', 'exefs/sdk', 'exefs/main.npdm') {
+            if (!(Test-Path (Join-Path $dump $file) -PathType Leaf)) { throw "Missing dump file: $file" }
+          }
+          foreach ($folder in 'romfs/Layout', 'romfs/Mii', 'romfs/Pack') {
+            if (!(Test-Path (Join-Path $dump $folder) -PathType Container)) { throw "Missing dump folder: $folder" }
+          }
+
+      - name: Translate the game code for the Android build
+        working-directory: recomp
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Reuse the upstream installer downloads and their checksum checks.
+          @'
+          import sys
+          from types import SimpleNamespace
+          sys.path.insert(0, "scripts")
+          import install
+          install.fetch("llvm")
+          if not install.find_runtime(SimpleNamespace(runtime=None, no_runtime=False)):
+              raise SystemExit("The pinned upstream runtime could not be downloaded")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $runtime = Get-Item 'deps/tomodachi-runtime-94537ac2f4.zip'
+          foreach ($stage in 'convert', 'tables', 'lift', 'sdk') {
+            python scripts/setup.py --dump ../dump --build build --runtime $runtime.FullName --jobs 2 --only $stage
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          python scripts/launcher_art.py ../dump build --fonts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Add Android memory mapping diagnostics
+        working-directory: recomp
+        shell: pwsh
+        run: |
+          $patch = @'
+          --- a/runtime/plat_posix.c
+          +++ b/runtime/plat_posix.c
+          @@ -6,6 +6,10 @@
+           #endif
+           #include "plat/windows.h"
+           #include <errno.h>
+          +#ifdef __ANDROID__
+          +#include <stdio.h>
+          +#include <string.h>
+          +#endif
+           #include <fcntl.h>
+           #include <unistd.h>
+           #include <dirent.h>
+          @@ -1020,6 +1024,42 @@
+               return i < 0;
+           }
+           #endif
+          +#ifdef __ANDROID__
+          +static void log_fixed_mapping_failure(void *requested, size_t size, int flags,
+          +                                      void *result, int error) {
+          +    fprintf(stderr, "android mmap: requested=%p size=0x%zx flags=0x%x ",
+          +            requested, size, flags);
+          +    if (result == MAP_FAILED)
+          +        fprintf(stderr, "returned MAP_FAILED, errno=%d (%s)\n", error, strerror(error));
+          +    else
+          +        fprintf(stderr, "returned %p instead of the requested address\n", result);
+          +    fprintf(stderr, "android mmap: system page size=%ld\n", sysconf(_SC_PAGESIZE));
+          +
+          +    FILE *maps = fopen("/proc/self/maps", "r");
+          +    if (!maps) {
+          +        fprintf(stderr, "android mmap: cannot read /proc/self/maps: %s\n", strerror(errno));
+          +        fflush(stderr);
+          +        return;
+          +    }
+          +    const unsigned long long start = (uintptr_t)requested;
+          +    const unsigned long long end = start + size;
+          +    const unsigned long long margin = 0x200000;
+          +    char line[1024];
+          +    unsigned matches = 0;
+          +    while (fgets(line, sizeof(line), maps)) {
+          +        unsigned long long lo, hi;
+          +        if (sscanf(line, "%llx-%llx", &lo, &hi) != 2 ||
+          +            hi <= (start > margin ? start - margin : 0) || lo >= end + margin)
+          +            continue;
+          +        if (matches++ < 16)
+          +            fprintf(stderr, "android mmap: %s %s", hi > start && lo < end ? "overlap" : "nearby", line);
+          +    }
+          +    fclose(maps);
+          +    if (!matches) fprintf(stderr, "android mmap: no overlapping or nearby mappings found\n");
+          +    if (matches > 16) fprintf(stderr, "android mmap: %u additional mappings omitted\n", matches - 16);
+          +    fflush(stderr);
+          +}
+          +#endif
+           /* MEM_RESERVE maps the range PROT_NONE (address space only) and MEM_COMMIT is an mprotect; reservations start on 64 KB, the
+            * Windows allocation granularity. Decommit (VirtualFree MEM_DECOMMIT) drops the pages, so a new commit reads zeros as on Windows. */
+           LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot) {
+          @@ -1051,8 +1091,15 @@
+                       }
+                   }
+                   if (p == MAP_FAILED || (addr && (uintptr_t)p != lo)) {
+          +#ifdef __ANDROID__
+          +            int mapping_error = p == MAP_FAILED ? errno : 0;
+          +#endif
+                       if (p != MAP_FAILED) munmap(p, nm);
+                       pthread_mutex_unlock(&g_vm_lock);
+          +#ifdef __ANDROID__
+          +            if (addr) log_fixed_mapping_failure((void *)lo, nm, flags | MAP_FIXED_NOREPLACE,
+          +                                                p, mapping_error);
+          +#endif
+                       t_lasterr = ERROR_INVALID_ADDRESS;
+                       return NULL;
+                   }
+          '@
+          $patchPath = Join-Path $env:RUNNER_TEMP 'tomodachi-android-mmap.patch'
+          [IO.File]::WriteAllText($patchPath, $patch + "`n")
+          git apply --check -p2 --directory=build/work $patchPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply -p2 --directory=build/work $patchPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Rebase the Android guest address ranges
+        working-directory: recomp
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          work = Path("build/work")
+          lifted = work / "gen_eh_o2"
+          # The lifter analyzes the original addresses. Move its emitted addresses
+          # together with the staged runtime before compiling either Android library.
+          # Keep the low 32 address bits, including each offset and page alignment.
+          address = re.compile(
+              rb"\b(0x|[fuL]_)(7)([1-5][0-9a-fA-F]{8})(?=(?:[uUlL]+)?\b)"
+          )
+          checks = {
+              "hostrt.h": (b"GUEST_BASE 0x7100000000", b"GUEST_BASE 0x5100000000"),
+              "sdklift.h": (b"SDK_BASE 0x7500000000", b"SDK_BASE 0x5500000000"),
+          }
+          for name, (old, _) in checks.items():
+              if old not in (work / name).read_bytes():
+                  raise SystemExit(f"Unexpected original address layout in {name}")
+
+          main_files = sorted(lifted.glob("*.c"))
+          if not main_files or not (work / "sdklift_gen.c").is_file():
+              raise SystemExit("The translated main and SDK sources must exist before rebasing")
+
+          roots = (work / "plat", work / "nocrt", work / "fighter_sdk", lifted)
+          files = list(work.iterdir())
+          for root in roots:
+              files.extend(root.rglob("*"))
+          counts = {"runtime": 0, "main": 0, "sdk": 0}
+          for path in files:
+              if not path.is_file() or path.suffix not in {".c", ".h", ".inc", ".cpp"}:
+                  continue
+              old = path.read_bytes()
+              new, changed = address.subn(rb"\g<1>5\g<3>", old)
+              if path.name in {"nvn_gl.c", "nvn_vk_m4.c"}:
+                  new = re.sub(rb"(>> 28\) [!=]= )0x710\b", rb"\g<1>0x510", new)
+              if path.name == "debug_mode.c":
+                  new = re.sub(rb"(>> 32\) [<>=]+ )0x7([12])\b", rb"\g<1>0x5\g<2>", new)
+              if new != old:
+                  path.write_bytes(new)
+              group = "main" if path.parent == lifted else "sdk" if path.name == "sdklift_gen.c" else "runtime"
+              counts[group] += changed
+          for name, (_, new) in checks.items():
+              if new not in (work / name).read_bytes():
+                  raise SystemExit(f"Rebase did not update {name}")
+          if not all(counts.values()):
+              raise SystemExit(f"Missing rebased addresses in {counts}")
+          print(f"Android guest base 0x5100000000; rewritten address tokens: {counts}", flush=True)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and verify the signed ARM64 APK
+        working-directory: recomp
+        shell: pwsh
+        run: |
+          python scripts/android/build_libs.py --abi arm64-v8a --jobs 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $output = Join-Path $env:GITHUB_WORKSPACE 'android-output'
+          $apk = Join-Path $output 'TomodachiLife-arm64-v8a.apk'
+          python scripts/android/build_apk.py --abi arm64-v8a --libs build-android/libs/arm64-v8a --out $apk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $signer = Get-Item (Join-Path $env:ANDROID_HOME 'build-tools/35.0.0/apksigner.bat')
+          & $signer.FullName verify $apk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $state = Get-Content build/state.json -Raw | ConvertFrom-Json
+          $game = Join-Path $output 'TomodachiLife/game'
+          New-Item -ItemType Directory -Path $game | Out-Null
+          foreach ($file in 'main.elf', 'sdk.elf', 'main.npdm') {
+            Copy-Item "build/binaries/$($state.game_version)/$file" $game
+          }
+          Copy-Item runtime/fonts_open (Join-Path $output 'TomodachiLife/fonts') -Recurse
+          if (Test-Path build/work/ui) {
+            Copy-Item build/work/ui (Join-Path $output 'TomodachiLife/ui') -Recurse
+          }
+
+      - name: Save the APK and required support files
+        uses: actions/upload-artifact@v4
+        with:
+          name: TomodachiLife-Android-ARM64-Rebase
+          path: android-output/
+          if-no-files-found: error
+          retention-days: 1
